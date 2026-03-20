@@ -18,7 +18,7 @@ import inspect
 import itertools
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from datetime import timedelta
 from typing import (
@@ -89,9 +89,14 @@ from zenml.execution.pipeline.dynamic.outputs import (
 from zenml.execution.pipeline.dynamic.run_context import (
     DynamicPipelineRunContext,
 )
+from zenml.execution.pipeline.dynamic.startup_controller import (
+    StartupController,
+    _StartupStatus,
+)
 from zenml.execution.pipeline.dynamic.utils import (
     _Unmapped,
     load_step_run_outputs,
+    wait_for_step_to_finish,
 )
 from zenml.execution.pipeline.utils import compute_invocation_id
 from zenml.execution.step.utils import launch_step
@@ -158,6 +163,15 @@ class _WaitConditionState(NamedTuple):
     value: Any
 
 
+class _PreparedStepLaunch(NamedTuple):
+    """Prepared launch state for a ready step invocation."""
+
+    compiled_step: "Step"
+    runtime: StepRuntime
+    remaining_retries: Optional[int]
+    existing_step_run: Optional["StepRunResponse"]
+
+
 class DynamicPipelineRunner:
     """Dynamic pipeline runner."""
 
@@ -208,12 +222,14 @@ class DynamicPipelineRunner:
         self._step_operator = Stack.from_model(snapshot.stack).step_operator
         self._futures: Dict[str, "StepFuture"] = {}
         self._invocation_ids: Set[str] = set()
+        self._state_lock = threading.RLock()
 
         self._run, self._orchestrator_run_id = self._prepare_run(run)
         self._existing_step_runs = self._run.steps
 
         self._steps_to_monitor: Dict[str, "StepRunResponse"] = {}
         self._shutdown_event = threading.Event()
+        self._startup_controller = StartupController(self)
 
     def _prepare_run(
         self, run: Optional["PipelineRunResponse"]
@@ -257,6 +273,15 @@ class DynamicPipelineRunner:
         return run, orchestrator_run_id
 
     @property
+    def run(self) -> "PipelineRunResponse":
+        """The pipeline run being executed.
+
+        Returns:
+            The pipeline run being executed.
+        """
+        return self._run
+
+    @property
     def pipeline(self) -> "DynamicPipeline":
         """The pipeline that the runner is executing.
 
@@ -285,13 +310,155 @@ class DynamicPipelineRunner:
 
         return self._pipeline
 
+    def _track_future(self, invocation_id: str, future: "StepFuture") -> None:
+        """Track a step future for shutdown and waiting.
+
+        Args:
+            invocation_id: The invocation ID of the step.
+            future: The future to track.
+        """
+        with self._state_lock:
+            self._futures[invocation_id] = future
+
+    def _reserve_invocation_id(
+        self, step: "BaseStep", custom_id: Optional[str]
+    ) -> str:
+        """Reserve the next invocation ID for a submitted step.
+
+        Args:
+            step: The submitted step.
+            custom_id: Optional explicit invocation ID.
+
+        Returns:
+            The reserved invocation ID.
+        """
+        with self._state_lock:
+            invocation_id = compute_invocation_id(
+                existing_invocations=self._invocation_ids,
+                step=step,
+                custom_id=custom_id,
+                allow_suffix=not custom_id,
+            )
+            self._invocation_ids.add(invocation_id)
+
+        return invocation_id
+
+    def _create_step_config(
+        self, group: Optional["GroupInfo"]
+    ) -> Optional["StepConfigurationUpdate"]:
+        """Create deployment or group-specific step configuration overrides.
+
+        Args:
+            group: Optional group information for the step.
+
+        Returns:
+            Optional step configuration overrides.
+        """
+        if self._run and self._run.triggered_by_deployment:
+            return StepConfigurationUpdate(
+                enable_cache=False,
+                step_operator=None,
+                parameters={},
+                runtime=StepRuntime.INLINE,
+                group=group,
+            )
+        elif group:
+            return StepConfigurationUpdate(group=group)
+
+        return None
+
+    def _log_waiting_for_steps(
+        self, waiting_for_steps: List[str], invocation_id: str
+    ) -> None:
+        """Log that a step is waiting on upstream work.
+
+        Args:
+            waiting_for_steps: The upstream invocation IDs that are in progress.
+            invocation_id: The downstream invocation ID.
+        """
+        logger.info(
+            "Waiting for step(s) `%s` to finish before executing step `%s`.",
+            ", ".join(waiting_for_steps),
+            invocation_id,
+        )
+
+    def _predict_step_runtime(
+        self,
+        step: "BaseStep",
+        step_config: Optional["StepConfigurationUpdate"],
+    ) -> StepRuntime:
+        """Predict the runtime of a step before dispatch.
+
+        Args:
+            step: The step to predict.
+            step_config: Optional step configuration overrides.
+
+        Returns:
+            The predicted runtime of the step.
+        """
+        config = step.configuration.model_copy(deep=True)
+        if template := get_config_template(self._snapshot, step, self.pipeline):
+            config = template.config.model_copy(
+                update={"template": template.spec.invocation_id}
+            )
+
+        if step_config:
+            config = config.model_copy(
+                update=step_config.model_dump(exclude_unset=True)
+            )
+
+        return get_step_runtime(
+            step_config=config,
+            pipeline_docker_settings=self._snapshot.pipeline_configuration.docker_settings,
+            orchestrator=self._orchestrator,
+        )
+
+    def _resolve_step_inputs(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
+        """Resolve already-ready dynamic step inputs.
+
+        Args:
+            inputs: The step inputs to resolve.
+
+        Returns:
+            The resolved step inputs.
+        """
+        return await_step_inputs(inputs)
+
+    def _expand_map_inputs(
+        self, inputs: Dict[str, Any], product: bool
+    ) -> List[Dict[str, Any]]:
+        """Expand mapped step inputs after dependencies are ready.
+
+        Args:
+            inputs: The concrete step inputs.
+            product: Whether to create a cartesian product expansion.
+
+        Returns:
+            The expanded step input dictionaries.
+        """
+        return expand_mapped_inputs(inputs, product=product)
+
+    def _get_running_upstream_steps_for_startup_controller(
+        self,
+        inputs: Dict[str, Any],
+        after: Union["AnyStepFuture", Sequence["AnyStepFuture"], None],
+    ) -> List[str]:
+        """Get currently running upstream step IDs without blocking.
+
+        Args:
+            inputs: The raw step inputs.
+            after: Optional upstream ordering futures.
+
+        Returns:
+            The running upstream invocation IDs.
+        """
+        return _get_running_upstream_steps(inputs=inputs, after=after)
+
     def _monitoring_loop(self) -> None:
         """Monitoring loop.
 
         This should run in a separate thread and monitors the running steps.
         """
-        from zenml.config.step_configurations import Step
-
         monitoring_interval = handle_float_env_var(
             ENV_ZENML_DYNAMIC_PIPELINE_MONITORING_INTERVAL, default=10.0
         )
@@ -301,13 +468,14 @@ class DynamicPipelineRunner:
 
         while not self._shutdown_event.is_set():
             start_time = time.time()
-            finished_step_runs = []
+            finished_step_runs: List[Tuple[str, "StepRunResponse"]] = []
 
             # Copy the steps to avoid the dictionary getting modified by
             # the main thread while we're iterating over it.
-            for invocation_id, step_run in list(
-                self._steps_to_monitor.items()
-            ):
+            with self._state_lock:
+                monitored_step_runs = list(self._steps_to_monitor.items())
+
+            for invocation_id, step_run in monitored_step_runs:
                 infra_status: Optional[ExecutionStatus] = None
                 try:
                     infra_status = self._get_isolated_step_infra_status(
@@ -337,7 +505,8 @@ class DynamicPipelineRunner:
 
                 step_run = Client().get_run_step(step_run.id)
                 # Store the refreshed step run
-                self._steps_to_monitor[invocation_id] = step_run
+                with self._state_lock:
+                    self._steps_to_monitor[invocation_id] = step_run
 
                 db_status = step_run.status
 
@@ -351,7 +520,7 @@ class DynamicPipelineRunner:
                     # monitoring interval to check again.
                     continue
 
-                finished_step_runs.append(invocation_id)
+                finished_step_runs.append((invocation_id, step_run))
 
                 if db_status == ExecutionStatus.STOPPING:
                     # The step runner sets the status to STOPPING when receiving
@@ -432,17 +601,26 @@ class DynamicPipelineRunner:
                         )
 
                     if remaining_retries > 0:
-                        step = Step(
-                            spec=step_run.spec,
-                            config=step_run.config,
-                            step_config_overrides=step_run.config,
+                        self._retry_isolated_step(step_run=step_run)
+                    else:
+                        self._startup_controller.notify_isolated_step_finished(
+                            invocation_id=invocation_id, step_run=step_run
                         )
-                        self._queue_concurrent_isolated_step(step=step)
+                else:
+                    self._startup_controller.notify_isolated_step_finished(
+                        invocation_id=invocation_id, step_run=step_run
+                    )
 
                 time.sleep(monitoring_delay)
 
-            for invocation_id in finished_step_runs:
-                self._steps_to_monitor.pop(invocation_id)
+            for invocation_id, finished_step_run in finished_step_runs:
+                with self._state_lock:
+                    current_step_run = self._steps_to_monitor.get(invocation_id)
+                    if (
+                        current_step_run
+                        and current_step_run.id == finished_step_run.id
+                    ):
+                        self._steps_to_monitor.pop(invocation_id)
 
             duration = time.time() - start_time
             time_to_sleep = max(0, monitoring_interval - duration)
@@ -462,7 +640,10 @@ class DynamicPipelineRunner:
 
         logger.info("Stopping isolated steps.")
 
-        for step_run in list(self._steps_to_monitor.values()):
+        with self._state_lock:
+            step_runs_to_stop = list(self._steps_to_monitor.values())
+
+        for step_run in step_runs_to_stop:
             try:
                 self._stop_isolated_step(step_run)
             except Exception:
@@ -613,8 +794,9 @@ class DynamicPipelineRunner:
                         )
 
                     self._maybe_stop_isolated_steps()
-                    self._executor.shutdown(wait=True, cancel_futures=True)
                     monitoring_thread.join()
+                    self._startup_controller.shutdown()
+                    self._executor.shutdown(wait=True, cancel_futures=True)
 
                 self._run = Client().zen_store.get_run(
                     self._run.id, hydrate=False
@@ -676,36 +858,29 @@ class DynamicPipelineRunner:
             The step run outputs or a future for the step run outputs.
         """
         step = step.copy()
-        step_config = None
-        if self._run and self._run.triggered_by_deployment:
-            # Deployment-specific step overrides
-            step_config = StepConfigurationUpdate(
-                enable_cache=False,
-                step_operator=None,
-                parameters={},
-                runtime=StepRuntime.INLINE,
-                group=group,
-            )
-        elif group:
-            step_config = StepConfigurationUpdate(
-                group=group,
-            )
-
+        step_config = self._create_step_config(group=group)
         inputs = convert_to_keyword_arguments(step.entrypoint, args, kwargs)
+        invocation_id = self._reserve_invocation_id(step=step, custom_id=id)
+        waiting_for_steps = _get_running_upstream_steps(inputs, after)
 
-        invocation_id = compute_invocation_id(
-            existing_invocations=self._invocation_ids,
-            step=step,
-            custom_id=id,
-            allow_suffix=not id,
-        )
-        self._invocation_ids.add(invocation_id)
+        if concurrent:
+            return self._startup_controller.submit_step(
+                step=step,
+                invocation_id=invocation_id,
+                inputs=inputs,
+                after=after,
+                step_config=step_config,
+                output_keys=list(step.entrypoint_definition.outputs),
+                runtime=self._predict_step_runtime(
+                    step=step, step_config=step_config
+                ),
+                waiting_for_steps=waiting_for_steps,
+            )
 
-        if waiting_for_steps := _get_running_upstream_steps(inputs, after):
-            logger.info(
-                "Waiting for step(s) `%s` to finish before executing step `%s`.",
-                ", ".join(waiting_for_steps),
-                invocation_id,
+        if waiting_for_steps:
+            self._log_waiting_for_steps(
+                waiting_for_steps=waiting_for_steps,
+                invocation_id=invocation_id,
             )
 
         compiled_step = compile_dynamic_step_invocation(
@@ -718,7 +893,71 @@ class DynamicPipelineRunner:
             after=after,
             config=step_config,
         )
+        prepared = self._prepare_compiled_step_launch(
+            invocation_id=invocation_id,
+            compiled_step=compiled_step,
+        )
+        existing_step_result = self._maybe_handle_existing_step_run_sync(
+            invocation_id=invocation_id,
+            prepared=prepared,
+        )
+        if existing_step_result is not None:
+            return existing_step_result
 
+        step_run = self._run_sync_step(
+            step=prepared.compiled_step,
+            remaining_retries=prepared.remaining_retries,
+        )
+        return load_step_run_outputs(step_run.id)
+
+    def _prepare_step_launch_for_startup_controller(
+        self,
+        step: "BaseStep",
+        invocation_id: str,
+        inputs: Dict[str, Any],
+        after: Union["AnyStepFuture", Sequence["AnyStepFuture"], None],
+        step_config: Optional["StepConfigurationUpdate"],
+    ) -> _PreparedStepLaunch:
+        """Prepare a ready startup-controlled invocation for dispatch.
+
+        Args:
+            step: The submitted step.
+            invocation_id: The invocation ID of the step.
+            inputs: The already-resolved step inputs.
+            after: Optional upstream futures for ordering metadata.
+            step_config: Optional step configuration overrides.
+
+        Returns:
+            The prepared launch state.
+        """
+        upstream_steps = _collect_upstream_steps(after=after, inputs=inputs)
+        compiled_step = compile_resolved_dynamic_step_invocation(
+            snapshot=self._snapshot,
+            pipeline=self.pipeline,
+            step=step,
+            invocation_id=invocation_id,
+            inputs=inputs,
+            upstream_steps=upstream_steps,
+            pipeline_docker_settings=self._snapshot.pipeline_configuration.docker_settings,
+            config=step_config,
+        )
+        return self._prepare_compiled_step_launch(
+            invocation_id=invocation_id,
+            compiled_step=compiled_step,
+        )
+
+    def _prepare_compiled_step_launch(
+        self, invocation_id: str, compiled_step: "Step"
+    ) -> _PreparedStepLaunch:
+        """Prepare a compiled step launch.
+
+        Args:
+            invocation_id: The invocation ID of the step.
+            compiled_step: The compiled step configuration.
+
+        Returns:
+            The prepared launch state.
+        """
         step_run = self._existing_step_runs.get(invocation_id)
         runtime = get_step_runtime(
             step_config=compiled_step.config,
@@ -729,9 +968,6 @@ class DynamicPipelineRunner:
 
         if step_run:
             old_config = step_run.config.model_copy(deep=True)
-            # The server includes the date/time substitutions based on the
-            # actual DB start time of the pipeline run. We want to compare this
-            # to the newly compiled step config, so we remove them.
             old_config.substitutions.pop("date")
             old_config.substitutions.pop("time")
 
@@ -739,13 +975,6 @@ class DynamicPipelineRunner:
                 old_config.model_dump_json()
                 != compiled_step.config.model_dump_json()
             ):
-                # We use the old config here to keep the behavior aligned across
-                # all step retries: When the orchestration environment is
-                # restarted while an isolated step is running, the code below
-                # will start monitoring that existing execution. If that step
-                # then fails, the monitoring loop will restart it with the
-                # configuration of the step run that just failed, which is the
-                # old (=compiled in previous orchestration environment) config.
                 compiled_step = Step(
                     spec=step_run.spec,
                     config=old_config,
@@ -758,138 +987,131 @@ class DynamicPipelineRunner:
                     step_run.name,
                 )
 
-            if step_run.status.is_successful:
-                # The step finished successfully, but we still need to return
-                # a future in case the step was launched concurrently so the
-                # caller gets the correct object back.
-                if concurrent:
-                    future = StepFuture(
-                        wrapped=_IsolatedStepFuture(
-                            pipeline_run_id=self._run.id,
-                            invocation_id=invocation_id,
-                        ),
-                        output_keys=list(compiled_step.config.outputs),
-                    )
-                    self._futures[invocation_id] = future
-                    return future
-                else:
-                    return load_step_run_outputs(step_run.id)
-
             if (
                 runtime == StepRuntime.INLINE
                 and step_run.status == ExecutionStatus.RUNNING
             ):
-                # Inline steps that are in running state didn't have the
-                # chance to report their failure back to ZenML before the
-                # orchestration environment was shut down. But there is no
-                # way that they're actually still running if we're in a new
-                # orchestration environment, so we mark them as failed and
-                # potentially restart them depending on the retry config.
                 step_run = publish_failed_step_run(step_run.id)
-
-            if step_run.status.is_failed:
-                # If the step is running concurrently, we only raise the
-                # exception once the future is awaited.
-                if concurrent:
-                    future = StepFuture(
-                        wrapped=_IsolatedStepFuture(
-                            pipeline_run_id=self._run.id,
-                            invocation_id=invocation_id,
-                        ),
-                        output_keys=list(compiled_step.config.outputs),
-                    )
-                    self._futures[invocation_id] = future
-                    return future
-                else:
-                    raise exception_utils.reconstruct_exception(
-                        exception_info=step_run.exception_info,
-                        fallback_message=(
-                            f"Step `{invocation_id}` failed with status "
-                            f"`{step_run.status}`."
-                        ),
-                    )
 
             remaining_retries = get_remaining_retries(step_run=step_run)
 
-            if step_run.status == ExecutionStatus.RUNNING:
-                logger.info(
-                    "Restarting the monitoring of existing step `%s` "
-                    "(ID: %s). Remaining retries: %d",
-                    step_run.name,
-                    step_run.id,
-                    remaining_retries,
-                )
-                self._steps_to_monitor[invocation_id] = step_run
-                monitoring_future = StepFuture(
-                    wrapped=_IsolatedStepFuture(
-                        pipeline_run_id=self._run.id,
-                        invocation_id=invocation_id,
-                    ),
-                    output_keys=list(compiled_step.config.outputs),
-                )
-                self._futures[invocation_id] = monitoring_future
-                return monitoring_future
+        return _PreparedStepLaunch(
+            compiled_step=compiled_step,
+            runtime=runtime,
+            remaining_retries=remaining_retries,
+            existing_step_run=step_run,
+        )
 
-        if not concurrent:
-            step_run = self._run_sync_step(
-                step=compiled_step, remaining_retries=remaining_retries
+    # TODO: when a step run exists, we need to make sure that the new cache
+    # key is identical to the old one, and fail otherwise.
+    def _maybe_handle_existing_step_run_sync(
+        self, invocation_id: str, prepared: _PreparedStepLaunch
+    ) -> Optional[StepRunOutputs]:
+        """Handle reuse of an existing step run in the sync path.
+
+        Args:
+            invocation_id: The invocation ID of the step.
+            prepared: The prepared launch state.
+
+        Raises:
+            BaseException: If the existing step run failed.
+
+        Returns:
+            The existing step outputs if handled, otherwise `None`.
+        """
+        step_run = prepared.existing_step_run
+        if not step_run:
+            return None
+
+        if step_run.status.is_successful:
+            return load_step_run_outputs(step_run.id)
+
+        if step_run.status.is_failed:
+            raise self._reconstruct_step_run_exception(
+                invocation_id=invocation_id, step_run=step_run
+            )
+
+        if step_run.status == ExecutionStatus.RUNNING:
+            logger.info(
+                "Restarting the monitoring of existing step `%s` "
+                "(ID: %s). Remaining retries: %d",
+                step_run.name,
+                step_run.id,
+                prepared.remaining_retries,
+            )
+            with self._state_lock:
+                self._steps_to_monitor[invocation_id] = step_run
+
+            step_run = wait_for_step_to_finish(
+                pipeline_run_id=self._run.id,
+                step_name=invocation_id,
             )
             return load_step_run_outputs(step_run.id)
-        elif runtime == StepRuntime.INLINE:
-            return self._queue_concurrent_inline_step(
-                step=compiled_step, remaining_retries=remaining_retries
-            )
-        else:
-            return self._queue_concurrent_isolated_step(step=compiled_step)
 
-    def _queue_concurrent_isolated_step(self, step: "Step") -> StepFuture:
-        """Queue a concurrent isolated step.
+        return None
+
+    def _maybe_handle_existing_step_run_for_startup_controller(
+        self,
+        invocation_id: str,
+        prepared: _PreparedStepLaunch,
+        wrapped_future: Union["_InlineStepFuture", "_IsolatedStepFuture"],
+    ) -> Optional["_StartupStatus"]:
+        """Handle reuse of an existing step run in the startup path.
 
         Args:
-            step: The step to queue.
+            invocation_id: The invocation ID of the step.
+            prepared: The prepared launch state.
+            wrapped_future: The wrapped startup-managed future.
 
         Returns:
-            The step future.
+            The resulting startup-controller status if handled, otherwise `None`.
         """
+        step_run = prepared.existing_step_run
+        if not step_run:
+            return None
 
-        def _launch_no_wait() -> StepRunResponse:
-            step_run = launch_step(
-                snapshot=self._snapshot,
-                step=step,
-                orchestrator_run_id=self._orchestrator_run_id,
-                # The monitoring loop is responsible for monitoring and retrying
-                # steps.
-                wait=False,
-                retry=False,
+        if step_run.status.is_successful:
+            wrapped_future._set_terminal_result(step_run)
+            return _StartupStatus.FINISHED_SUCCESS
+
+        if step_run.status.is_failed:
+            wrapped_future._set_terminal_exception(
+                self._reconstruct_step_run_exception(
+                    invocation_id=invocation_id,
+                    step_run=step_run,
+                )
             )
-            self._steps_to_monitor[step.spec.invocation_id] = step_run
-            return step_run
+            return _StartupStatus.FINISHED_FAILED
 
-        concurrent_future = self._executor.submit(
-            context_utils.run_in_current_context, _launch_no_wait
-        )
-        future = StepFuture(
-            wrapped=_IsolatedStepFuture(
-                wrapped=concurrent_future,
-                pipeline_run_id=self._run.id,
-                invocation_id=step.spec.invocation_id,
-            ),
-            output_keys=list(step.config.outputs),
-        )
-        self._futures[step.spec.invocation_id] = future
-        return future
+        if step_run.status == ExecutionStatus.RUNNING:
+            logger.info(
+                "Restarting the monitoring of existing step `%s` "
+                "(ID: %s). Remaining retries: %d",
+                step_run.name,
+                step_run.id,
+                prepared.remaining_retries,
+            )
+            with self._state_lock:
+                self._steps_to_monitor[invocation_id] = step_run
+            if isinstance(wrapped_future, _IsolatedStepFuture):
+                wrapped_future._mark_dispatched()
+            return _StartupStatus.ACTIVE_ISOLATED
 
-    def _queue_concurrent_inline_step(
-        self, step: "Step", remaining_retries: Optional[int] = None
-    ) -> StepFuture:
-        """Queue a concurrent inline step.
+        return None
+
+    def _launch_scheduled_inline_step(
+        self,
+        step: "Step",
+        remaining_retries: Optional[int] = None,
+    ) -> Future["StepRunResponse"]:
+        """Launch a scheduled inline step in the runner executor.
 
         Args:
-            step: The step to queue.
-            remaining_retries: The remaining retries for the step.
+            step: The inline step to launch.
+            remaining_retries: The remaining retry budget.
 
         Returns:
-            The step future.
+            The executor future of the inline execution.
         """
 
         def _launch_and_wait() -> StepRunResponse:
@@ -897,18 +1119,77 @@ class DynamicPipelineRunner:
                 step=step, remaining_retries=remaining_retries
             )
 
-        concurrent_future = self._executor.submit(
+        return self._executor.submit(
             context_utils.run_in_current_context, _launch_and_wait
         )
-        future = StepFuture(
-            wrapped=_InlineStepFuture(
-                wrapped=concurrent_future,
-                invocation_id=step.spec.invocation_id,
-            ),
-            output_keys=list(step.config.outputs),
+
+    def _launch_scheduled_isolated_step(
+        self,
+        step: "Step",
+        wrapped_future: Optional["_IsolatedStepFuture"] = None,
+    ) -> "StepRunResponse":
+        """Launch a scheduled isolated step and start monitoring it.
+
+        Args:
+            step: The isolated step to launch.
+            wrapped_future: Optional wrapped isolated step future.
+
+        Returns:
+            The launched step run.
+        """
+        step_run = launch_step(
+            snapshot=self._snapshot,
+            step=step,
+            orchestrator_run_id=self._orchestrator_run_id,
+            wait=False,
+            retry=False,
         )
-        self._futures[step.spec.invocation_id] = future
-        return future
+        with self._state_lock:
+            self._steps_to_monitor[step.spec.invocation_id] = step_run
+        if wrapped_future is not None:
+            wrapped_future._mark_dispatched()
+        return step_run
+
+    def _retry_isolated_step(
+        self,
+        step_run: "StepRunResponse",
+    ) -> "StepRunResponse":
+        """Retry an isolated step run.
+
+        Args:
+            step_run: The failed step run to retry.
+
+        Returns:
+            The relaunched step run.
+        """
+        step = Step(
+            spec=step_run.spec,
+            config=step_run.config,
+            step_config_overrides=step_run.config,
+        )
+        return self._launch_scheduled_isolated_step(
+            step=step,
+        )
+
+    def _reconstruct_step_run_exception(
+        self, invocation_id: str, step_run: "StepRunResponse"
+    ) -> BaseException:
+        """Reconstruct the exception of a failed step run.
+
+        Args:
+            invocation_id: The invocation ID of the step.
+            step_run: The failed step run.
+
+        Returns:
+            The reconstructed exception.
+        """
+        return exception_utils.reconstruct_exception(
+            exception_info=step_run.exception_info,
+            fallback_message=(
+                f"Step `{invocation_id}` failed with status "
+                f"`{step_run.status}`."
+            ),
+        )
 
     def _run_sync_step(
         self,
@@ -956,8 +1237,6 @@ class DynamicPipelineRunner:
             A future that represents the map results.
         """
         kwargs = convert_to_keyword_arguments(step.entrypoint, args, kwargs)
-        kwargs = await_step_inputs(kwargs)
-        step_inputs = expand_mapped_inputs(kwargs, product=product)
 
         # This will overwrite any user-configured groups for the step, but
         # capturing the mapping information is more important until we introduce
@@ -967,21 +1246,13 @@ class DynamicPipelineRunner:
             name=step.name,
             type=GroupType.MAP,
         )
-
-        step_futures = [
-            self.launch_step(
-                step,
-                id=None,
-                args=(),
-                kwargs=inputs,
-                after=after,
-                group=group_info,
-                concurrent=True,
-            )
-            for inputs in step_inputs
-        ]
-
-        return MapResultsFuture(futures=step_futures)
+        return self._startup_controller.submit_map(
+            step=step.copy(),
+            kwargs=kwargs,
+            after=after,
+            product=product,
+            group_info=group_info,
+        )
 
     @overload
     def wait(
@@ -1244,9 +1515,13 @@ class DynamicPipelineRunner:
 
     def await_all_step_futures(self) -> None:
         """Await all step futures."""
-        for future in list(self._futures.values()):
+        self._startup_controller.await_all()
+        with self._state_lock:
+            futures = list(self._futures.values())
+        for future in futures:
             future.wait()
-        self._futures = {}
+        with self._state_lock:
+            self._futures = {}
 
     def has_in_progress_steps(self) -> bool:
         """Check if there are any in-progress steps.
@@ -1254,7 +1529,12 @@ class DynamicPipelineRunner:
         Returns:
             True if there are any in-progress steps, False otherwise.
         """
-        return any(future.running() for future in list(self._futures.values()))
+        with self._state_lock:
+            futures = list(self._futures.values())
+
+        return self._startup_controller.has_in_progress_steps() or any(
+            future.running() for future in futures
+        )
 
 
 def compile_dynamic_step_invocation(
@@ -1282,38 +1562,45 @@ def compile_dynamic_step_invocation(
     Returns:
         The compiled step.
     """
-    upstream_steps = set()
-
-    if isinstance(after, BaseStepFuture):
-        after.result()
-        upstream_steps.add(after.invocation_id)
-    elif isinstance(after, MapResultsFuture):
-        for future in after:
-            future.result()
-            upstream_steps.add(future.invocation_id)
-    elif isinstance(after, Sequence):
-        for item in after:
-            if isinstance(item, BaseStepFuture):
-                item.result()
-                upstream_steps.add(item.invocation_id)
-            elif isinstance(item, MapResultsFuture):
-                for future in item:
-                    future.result()
-                    upstream_steps.add(future.invocation_id)
-
     inputs = await_step_inputs(inputs)
+    upstream_steps = _collect_upstream_steps(after=after, inputs=inputs)
+    return compile_resolved_dynamic_step_invocation(
+        snapshot=snapshot,
+        pipeline=pipeline,
+        step=step,
+        invocation_id=invocation_id,
+        inputs=inputs,
+        upstream_steps=upstream_steps,
+        pipeline_docker_settings=pipeline_docker_settings,
+        config=config,
+    )
 
-    for value in inputs.values():
-        if isinstance(value, OutputArtifact):
-            upstream_steps.add(value.step_name)
 
-        if (
-            isinstance(value, Sequence)
-            and value
-            and all(isinstance(item, OutputArtifact) for item in value)
-        ):
-            upstream_steps.update(item.step_name for item in value)
+def compile_resolved_dynamic_step_invocation(
+    snapshot: "PipelineSnapshotResponse",
+    pipeline: "DynamicPipeline",
+    step: "BaseStep",
+    invocation_id: str,
+    inputs: Dict[str, Any],
+    upstream_steps: Set[str],
+    pipeline_docker_settings: "DockerSettings",
+    config: Optional[StepConfigurationUpdate] = None,
+) -> "Step":
+    """Compile a dynamic step invocation with already-resolved inputs.
 
+    Args:
+        snapshot: The pipeline snapshot.
+        pipeline: The dynamic pipeline.
+        step: The step to compile.
+        invocation_id: The invocation ID of the step.
+        inputs: The already-resolved step inputs.
+        upstream_steps: The upstream invocation IDs of the step.
+        pipeline_docker_settings: The Docker settings of the parent pipeline.
+        config: Optional step configuration overrides.
+
+    Returns:
+        The compiled step.
+    """
     input_artifacts = {}
     external_artifacts = {}
     for name, value in inputs.items():
@@ -1347,7 +1634,6 @@ def compile_dynamic_step_invocation(
         elif isinstance(value, (ArtifactVersionResponse, ExternalArtifact)):
             external_artifacts[name] = value
         else:
-            # TODO: should some of these be parameters?
             external_artifacts[name] = ExternalArtifact(value=value)
 
     if template := get_config_template(snapshot, step, pipeline):
@@ -1448,6 +1734,47 @@ def get_step_runtime(
             runtime = StepRuntime.INLINE
 
     return runtime
+
+
+def _collect_upstream_steps(
+    after: Union["AnyStepFuture", Sequence["AnyStepFuture"], None],
+    inputs: Dict[str, Any],
+) -> Set[str]:
+    """Collect upstream invocation IDs from resolved inputs and `after`.
+
+    Args:
+        after: Optional upstream futures used for ordering.
+        inputs: The already-resolved step inputs.
+
+    Returns:
+        The upstream invocation IDs of the step.
+    """
+    upstream_steps = set()
+
+    if isinstance(after, BaseStepFuture):
+        upstream_steps.add(after.invocation_id)
+    elif isinstance(after, MapResultsFuture):
+        upstream_steps.update(future.invocation_id for future in after)
+    elif isinstance(after, Sequence):
+        for item in after:
+            if isinstance(item, BaseStepFuture):
+                upstream_steps.add(item.invocation_id)
+            elif isinstance(item, MapResultsFuture):
+                upstream_steps.update(
+                    future.invocation_id for future in item
+                )
+
+    for value in inputs.values():
+        if isinstance(value, OutputArtifact):
+            upstream_steps.add(value.step_name)
+        elif (
+            isinstance(value, Sequence)
+            and value
+            and all(isinstance(item, OutputArtifact) for item in value)
+        ):
+            upstream_steps.update(item.step_name for item in value)
+
+    return upstream_steps
 
 
 def get_config_template(
@@ -1701,7 +2028,10 @@ def _get_running_upstream_steps(
 
     for future in futures:
         if isinstance(future, MapResultsFuture):
-            for item in future.futures:
+            expanded_futures = future.expanded_futures()
+            if expanded_futures is None:
+                continue
+            for item in expanded_futures:
                 if item.running():
                     steps.append(item.invocation_id)
         elif isinstance(future, BaseStepFuture):

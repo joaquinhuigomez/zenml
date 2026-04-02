@@ -83,6 +83,22 @@ def test_step_config_template_parameters_override_step_signature_defaults() -> (
         )()
 
 
+@step
+def list_consumer(input_: list[int]) -> None:
+    assert input_ == [1]
+
+
+@pipeline(enable_cache=False, dynamic=True)
+def pipeline_with_single_artifact_list_input() -> None:
+    list_consumer([producer()])
+
+
+def test_step_with_single_artifact_list_input_works() -> None:
+    """Tests that a single artifact wrapped in a list stays a list."""
+    with does_not_raise():
+        pipeline_with_single_artifact_list_input()
+
+
 def test_replay_skips_first_step_and_overrides_second_step_input():
     """Tests that replaying a pipeline and overriding step inputs works."""
     original_run = replay_pipeline(expected_consumer_input=1)

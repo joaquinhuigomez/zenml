@@ -352,24 +352,31 @@ class StrFilter(Filter):
         Raises:
             ValueError: If the comparison fails.
         """
-        from sqlalchemy import Float, and_, cast
+        from sqlalchemy import Float, and_, cast, or_
 
         try:
             numeric_column = cast(column, Float)
             assert self.value is not None
 
+            # Non-numeric values are cast to 0 and need to be excluded, but
+            # values that actually represent zero should still be compared.
+            is_numeric = or_(
+                numeric_column != 0,
+                column.in_(["0", "0.0", "-0", "-0.0"]),
+            )
+
             operations = {
                 GenericFilterOps.GT: lambda col, val: and_(
-                    col, col > float(val)
+                    is_numeric, col > float(val)
                 ),
                 GenericFilterOps.LT: lambda col, val: and_(
-                    col, col < float(val)
+                    is_numeric, col < float(val)
                 ),
                 GenericFilterOps.GTE: lambda col, val: and_(
-                    col, col >= float(val)
+                    is_numeric, col >= float(val)
                 ),
                 GenericFilterOps.LTE: lambda col, val: and_(
-                    col, col <= float(val)
+                    is_numeric, col <= float(val)
                 ),
             }
 

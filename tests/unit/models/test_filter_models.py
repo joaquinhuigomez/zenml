@@ -338,6 +338,72 @@ def test_float_field_supports_multiple_string_filters():
     assert [f.value for f in filters] == ["1", "1.3"]
 
 
+# Run metadata values are stored JSON-encoded, `"abc"` is a string value.
+METADATA_VALUES = ["0", "0.0", "-0.0", "0.5", "-1", "2", '"abc"']
+
+
+def _filter_run_metadata_values(filter_value: str) -> List[str]:
+    """Filter run metadata values on an in-memory database.
+
+    Args:
+        filter_value: The run metadata value filter, including the operator.
+
+    Returns:
+        The sorted matching run metadata values.
+    """
+    from sqlmodel import Session, create_engine, select
+
+    from zenml.zen_stores.schemas import RunMetadataSchema
+
+    engine = create_engine("sqlite://")
+    RunMetadataSchema.__table__.create(engine)
+    try:
+        with Session(engine) as session:
+            project_id = uuid.uuid4()
+            session.add_all(
+                [
+                    RunMetadataSchema(
+                        project_id=project_id,
+                        key="loss",
+                        value=value,
+                        type="float",
+                    )
+                    for value in METADATA_VALUES
+                ]
+            )
+            session.commit()
+
+            condition = BaseFilter.generate_custom_query_conditions_for_column(
+                value=filter_value, table=RunMetadataSchema, column="value"
+            )
+            return sorted(
+                session.exec(
+                    select(RunMetadataSchema.value).where(condition)
+                ).all()
+            )
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "filter_value, expected_values",
+    [
+        ("gt:-1", ["-0.0", "0", "0.0", "0.5", "2"]),
+        ("gt:0", ["0.5", "2"]),
+        ("gte:0", ["-0.0", "0", "0.0", "0.5", "2"]),
+        ("lt:0", ["-1"]),
+        ("lt:1", ["-0.0", "-1", "0", "0.0", "0.5"]),
+        ("lte:0", ["-0.0", "-1", "0", "0.0"]),
+        ("lte:1", ["-0.0", "-1", "0", "0.0", "0.5"]),
+    ],
+)
+def test_numeric_string_filter_includes_zero_values(
+    filter_value: str, expected_values: List[str]
+) -> None:
+    """Test numeric comparisons match zero but no non-numeric values."""
+    assert _filter_run_metadata_values(filter_value) == sorted(expected_values)
+
+
 def test_uuid_filter_model():
     """Test Filter model creation for UUID fields."""
     filter_value = uuid.uuid4()
